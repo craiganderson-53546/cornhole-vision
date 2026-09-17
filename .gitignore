@@ -1,0 +1,9 @@
+*.yuv420
+*.png
+*.o
+border_detect
+calibrate_teams
+.pio/
+__Pycache__/
+*.pyc
+
