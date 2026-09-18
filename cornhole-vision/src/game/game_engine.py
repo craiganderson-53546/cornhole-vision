@@ -53,9 +53,12 @@ ROUND_END_HOLD_SEC = 180     # fallback auto-score if the board is never
 PENDING_GRID_PX = 20         # bucket size for matching a new blob to itself
                               # across polls despite a few px of jitter
 
-TEAM_DISPLAY = {  # purely cosmetic, matches the ESP32 version's palette
-    'A': {'name': 'RED',  'fill': '#e94560', 'ring': '#ffaabb'},
-    'B': {'name': 'BLUE', 'fill': '#4d9de0', 'ring': '#a8d8ff'},
+TEAM_DISPLAY = {  # purely cosmetic, matches the ESP32 version's palette --
+    # keys are the physical calibration teams (team='A'|'B' as reported by
+    # detect_bags), values are just which color/label each one displays as.
+    # 'A' was calibrated against the blue bags, 'B' against the red bags.
+    'A': {'name': 'BLUE', 'fill': '#4d9de0', 'ring': '#a8d8ff'},
+    'B': {'name': 'RED',  'fill': '#e94560', 'ring': '#ffaabb'},
 }
 
 
@@ -99,7 +102,13 @@ class Bag:
     """One thrown bag, for the lifetime of the round (mirrors the
     ESP32 version's fixed 8-slot bags[] array, including keeping
     inactive/removed entries around so the UI can show them as
-    struck-through "ghost" rows, same as the original)."""
+    struck-through "ghost" rows, same as the original).
+
+    A bag with in_hole=True is permanently scored: once set, in_hole
+    never reverts to False, and `active` only goes False for it once
+    the hole is detected completely empty (see _match_existing) -- a
+    later bag landing on top and hiding this one from the camera is
+    not a removal event."""
     id: int          # 1-based throw order, used as the table row number
     team: str
     in_hole: bool
@@ -168,26 +177,54 @@ class GameEngine:
 
     def _match_existing(self, raw: List[BlobReading]) -> None:
         unmatched = list(raw)
+        # Whether *anything* is currently sitting in the hole, regardless
+        # of which bag it belongs to. Used below to tell "this hole bag
+        # is just covered by a later bag" apart from "the hole is
+        # genuinely empty" -- only the latter means a bag was actually
+        # picked up.
+        hole_has_any_blob = any(r.in_hole for r in raw)
+
         for bag in self.state.bags:
             if not bag.active:
                 continue
+
             match = self._nearest(bag, unmatched)
             if match is not None:
-                bag.cx, bag.cy, bag.in_hole = match.cx, match.cy, match.in_hole
+                bag.cx, bag.cy = match.cx, match.cy
+                # Once scored, a bag can't un-score itself: OR rather
+                # than overwrite, so a borderline reading at the hole's
+                # edge can't flicker it back to "board" after the fact.
+                bag.in_hole = bag.in_hole or match.in_hole
                 unmatched.remove(match)
                 self._missing_streak.pop(bag.id, None)
+                continue
+
+            if bag.in_hole and hole_has_any_blob:
+                # This bag went in the hole and is permanently scored.
+                # It's not matching any current blob because a later
+                # bag has landed on top and is hiding it from the
+                # camera -- not because it was removed. Something is
+                # still physically in the hole, so leave it locked in
+                # exactly as-is (no position update, no missing-streak,
+                # no chance of being struck through) until the hole is
+                # actually empty.
+                self._missing_streak.pop(bag.id, None)
+                continue
+
+            # Either a board bag with no matching blob, or a hole bag
+            # whose hole is now completely empty -- both mean an actual
+            # physical removal, so debounce and confirm it as normal.
+            streak = self._missing_streak.get(bag.id, 0) + 1
+            if streak >= REMOVE_CONFIRM_POLLS:
+                bag.active = False
+                self.state.bag_count -= 1
+                self.state.status_msg = (
+                    f"Bag {bag.id} removed. {self.state.bag_count} "
+                    f"bag(s) remain."
+                )
+                self._missing_streak.pop(bag.id, None)
             else:
-                streak = self._missing_streak.get(bag.id, 0) + 1
-                if streak >= REMOVE_CONFIRM_POLLS:
-                    bag.active = False
-                    self.state.bag_count -= 1
-                    self.state.status_msg = (
-                        f"Bag {bag.id} removed. {self.state.bag_count} "
-                        f"bag(s) remain."
-                    )
-                    self._missing_streak.pop(bag.id, None)
-                else:
-                    self._missing_streak[bag.id] = streak
+                self._missing_streak[bag.id] = streak
         # whatever's left in `unmatched` is handled by _confirm_new
         self._unmatched = unmatched
 
@@ -269,10 +306,12 @@ class GameEngine:
         net_b = max(0, pts_b - pts_a)
         self.state.score_a += net_a
         self.state.score_b += net_b
+        name_a, name_b = TEAM_DISPLAY['A']['name'], TEAM_DISPLAY['B']['name']
         self.state.status_msg = (
-            f"Round scored: RED +{net_a} (raw {pts_a})  "
-            f"BLUE +{net_b} (raw {pts_b})  |  "
-            f"Total RED {self.state.score_a} \u2013 BLUE {self.state.score_b}"
+            f"Round scored: {name_a} +{net_a} (raw {pts_a})  "
+            f"{name_b} +{net_b} (raw {pts_b})  |  "
+            f"Total {name_a} {self.state.score_a} \u2013 "
+            f"{name_b} {self.state.score_b}"
         )
 
     def _reset_round(self) -> None:
@@ -294,6 +333,46 @@ class GameEngine:
 # placement is the bag's position as a fraction of the ROI -- no
 # inches anywhere.
 
+def _invert_bilinear(px: float, py: float,
+                      p00: Tuple[float, float], p10: Tuple[float, float],
+                      p11: Tuple[float, float], p01: Tuple[float, float]
+                      ) -> Tuple[float, float]:
+    """Given a point P inside the quad p00->p10->p11->p01 (perimeter
+    order), returns (s, t) in [0,1]x[0,1] such that bilinearly
+    interpolating the 4 corners by (s, t) reproduces P. This is the
+    inverse of the standard bilinear quad parametrization -- used to
+    place a camera-space point correctly inside the rectified SVG
+    panel even though the board isn't axis-aligned in the raw frame."""
+    ex, ey = p10[0] - p00[0], p10[1] - p00[1]
+    fx, fy = p01[0] - p00[0], p01[1] - p00[1]
+    gx = p00[0] - p10[0] - p01[0] + p11[0]
+    gy = p00[1] - p10[1] - p01[1] + p11[1]
+    hx, hy = px - p00[0], py - p00[1]
+
+    def cross(ax, ay, bx, by):
+        return ax * by - ay * bx
+
+    A = cross(gx, gy, fx, fy)
+    B = cross(ex, ey, fx, fy) + cross(hx, hy, gx, gy)
+    C = cross(hx, hy, ex, ey)
+
+    if abs(A) < 1e-9:
+        t = -C / B if abs(B) > 1e-9 else 0.0
+    else:
+        disc = max(0.0, B * B - 4 * A * C)
+        sq = disc ** 0.5
+        t1, t2 = (-B + sq) / (2 * A), (-B - sq) / (2 * A)
+        candidates = [c for c in (t1, t2) if -0.05 <= c <= 1.05]
+        t = candidates[0] if candidates else min(max(t1, 0.0), 1.0)
+
+    denom_x, denom_y = ex + gx * t, ey + gy * t
+    if abs(denom_x) >= abs(denom_y):
+        s = (hx - fx * t) / denom_x if denom_x != 0 else 0.0
+    else:
+        s = (hy - fy * t) / denom_y if denom_y != 0 else 0.0
+    return s, t
+
+
 def build_board_svg(state: GameState, roi: dict) -> str:
     roi_w = max(1, roi['x1'] - roi['x0'])
     roi_h = max(1, roi['y1'] - roi['y0'])
@@ -301,11 +380,23 @@ def build_board_svg(state: GameState, roi: dict) -> str:
     scale = target_w / roi_w
     sw, sh = int(roi_w * scale), int(roi_h * scale)
 
-    def to_svg(cx: int, cy: int) -> Tuple[int, int]:
-        fx = (cx - roi['x0']) / roi_w
-        fy = (cy - roi['y0']) / roi_h
-        return (int(max(9, min(sw - 9, fx * sw))),
-                int(max(9, min(sh - 9, fy * sh))))
+    corners = roi.get('corners')  # 4 (x,y) points, perimeter order, or None
+    if corners is not None:
+        p00, p10, p11, p01 = corners
+
+        def to_svg(cx: int, cy: int) -> Tuple[int, int]:
+            s, t = _invert_bilinear(cx, cy, p00, p10, p11, p01)
+            return (int(max(9, min(sw - 9, s * sw))),
+                    int(max(9, min(sh - 9, t * sh))))
+    else:
+        # Older calibration with only a bounding box -- same linear
+        # fallback as before, imprecise for a board that isn't
+        # axis-aligned in the frame but still better than nothing.
+        def to_svg(cx: int, cy: int) -> Tuple[int, int]:
+            fx = (cx - roi['x0']) / roi_w
+            fy = (cy - roi['y0']) / roi_h
+            return (int(max(9, min(sw - 9, fx * sw))),
+                    int(max(9, min(sh - 9, fy * sh))))
 
     parts = [
         f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {sw} {sh}' "
@@ -351,12 +442,14 @@ def build_board_svg(state: GameState, roi: dict) -> str:
 
 def build_html(state: GameState, roi: dict) -> str:
     bags_each_side = MAX_BAGS // 2
-    red_thrown = sum(1 for b in state.bags if b.team == 'A')
-    blue_thrown = sum(1 for b in state.bags if b.team == 'B')
-    red_dots = "".join("&#9679;" if i < red_thrown else "&#9675;"
-                        for i in range(bags_each_side))
-    blue_dots = "".join("&#9679;" if i < blue_thrown else "&#9675;"
-                         for i in range(bags_each_side))
+    disp_a, disp_b = TEAM_DISPLAY['A'], TEAM_DISPLAY['B']
+    cls_a, cls_b = disp_a['name'].lower(), disp_b['name'].lower()
+    a_thrown = sum(1 for b in state.bags if b.team == 'A')
+    b_thrown = sum(1 for b in state.bags if b.team == 'B')
+    a_dots = "".join("&#9679;" if i < a_thrown else "&#9675;"
+                      for i in range(bags_each_side))
+    b_dots = "".join("&#9679;" if i < b_thrown else "&#9675;"
+                      for i in range(bags_each_side))
 
     remaining = MAX_BAGS - state.total_thrown
     if state.round_ending:
@@ -450,20 +543,20 @@ letter-spacing:1px;text-align:center;text-decoration:none;
 <h1>&#127919; Cornhole Scorer</h1>
 <p class='sub'>Auto-refreshes every 2 seconds</p>
 <div class='scoreboard'>
-<div class='score-team'><div class='score-name red'>RED</div>
-<div class='score-val red'>{state.score_a}</div></div>
+<div class='score-team'><div class='score-name {cls_a}'>{disp_a['name']}</div>
+<div class='score-val {cls_a}'>{state.score_a}</div></div>
 <div><div class='score-sep'>&#8211;</div><div class='score-lbl'>SCORE</div></div>
-<div class='score-team'><div class='score-name blue'>BLUE</div>
-<div class='score-val blue'>{state.score_b}</div></div>
+<div class='score-team'><div class='score-name {cls_b}'>{disp_b['name']}</div>
+<div class='score-val {cls_b}'>{state.score_b}</div></div>
 </div>
 <div class='prompt'>{prompt}</div>
 <div class='teams'>
-<div class='tcard red'><div class='tname red'>RED</div>
-<div class='dots red'>{red_dots}</div>
-<div class='tbags'>{red_thrown} of {bags_each_side} thrown</div></div>
-<div class='tcard blue'><div class='tname blue'>BLUE</div>
-<div class='dots blue'>{blue_dots}</div>
-<div class='tbags'>{blue_thrown} of {bags_each_side} thrown</div></div>
+<div class='tcard {cls_a}'><div class='tname {cls_a}'>{disp_a['name']}</div>
+<div class='dots {cls_a}'>{a_dots}</div>
+<div class='tbags'>{a_thrown} of {bags_each_side} thrown</div></div>
+<div class='tcard {cls_b}'><div class='tname {cls_b}'>{disp_b['name']}</div>
+<div class='dots {cls_b}'>{b_dots}</div>
+<div class='tbags'>{b_thrown} of {bags_each_side} thrown</div></div>
 </div>
 <div class='cards'>
 <div class='card'><div class='val'>{state.bag_count}</div><div class='lbl'>Bags on Board</div></div>

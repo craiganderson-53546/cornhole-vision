@@ -18,6 +18,12 @@
  * Usage:
  *   detect_bags <frame.yuv420> <calib_file>
  *
+ * Uses the board's true 4-corner quad from calibrate_teams (falling
+ * back to the plain bounding box for an older calibration file that
+ * predates it) so the scan follows the board's actual shape in the
+ * frame rather than a rectangle that's only approximately right for a
+ * board photographed at an angle.
+ *
  * Output (one line per bag found, to stdout):
  *   bag team=A in_hole=0 cx=612 cy=430 area=812
  *   bag team=B in_hole=1 cx=780 cy=415 area=790
@@ -64,6 +70,36 @@ typedef struct {
 typedef struct {
     int x0, y0, x1, y1; /* full-res (Y-plane) coordinates */
 } Rect;
+
+typedef struct {
+    double x, y;
+} Pt;
+
+/* Point-in-convex-quad test, mirrors the one in calibrate_teams.c --
+ * kept as a duplicate rather than a shared header, consistent with
+ * how roi_to_chroma is already duplicated between the two tools. */
+static int point_in_quad(double px, double py, const Pt quad[4]) {
+    double sign = 0.0;
+    for (int i = 0; i < 4; i++) {
+        Pt a = quad[i], b = quad[(i + 1) % 4];
+        double ex = b.x - a.x, ey = b.y - a.y;
+        double cx = px - a.x, cy = py - a.y;
+        double cross = ex * cy - ey * cx;
+        if (i == 0) {
+            sign = cross;
+        } else if (cross * sign < 0.0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void quad_to_chroma(const Pt full[4], Pt chroma_out[4]) {
+    for (int i = 0; i < 4; i++) {
+        chroma_out[i].x = full[i].x / 2.0;
+        chroma_out[i].y = full[i].y / 2.0;
+    }
+}
 
 typedef struct {
     double u_median, v_median;
@@ -158,6 +194,23 @@ static int kv_get(const KVStore *kv, const char *key, double *out) {
     return 0;
 }
 
+/* Returns 0 (leaving out[] untouched) for a calibration file that
+ * predates the 4-corner quad and only has the bounding box -- callers
+ * should treat that as "fall back to the plain bbox scan" rather than
+ * an error, so an old session.cal still works, just without the
+ * precision improvement. */
+static int kv_get_corners(const KVStore *kv, Pt out[4]) {
+    static const char *names[4][2] = {
+        {"roi_c0x", "roi_c0y"}, {"roi_c1x", "roi_c1y"},
+        {"roi_c2x", "roi_c2y"}, {"roi_c3x", "roi_c3y"},
+    };
+    for (int i = 0; i < 4; i++) {
+        if (!kv_get(kv, names[i][0], &out[i].x)) return 0;
+        if (!kv_get(kv, names[i][1], &out[i].y)) return 0;
+    }
+    return 1;
+}
+
 static int kv_require(const KVStore *kv, const char *key, double *out,
                        const char *calib_path) {
     if (kv_get(kv, key, out)) return 1;
@@ -179,8 +232,9 @@ typedef struct {
 #define MAX_BLOBS 32
 
 /* Returns the number of blobs found (up to MAX_BLOBS), or -1 on error. */
-static int find_all_blobs(const Frame *f, Rect roi_c, const ColorRef *bg,
-                           double bg_u_mad, double bg_v_mad, Blob *blobs_out) {
+static int find_all_blobs(const Frame *f, Rect roi_c, const Pt *quad_c,
+                           const ColorRef *bg, double bg_u_mad, double bg_v_mad,
+                           Blob *blobs_out) {
     int w = roi_c.x1 - roi_c.x0;
     int h = roi_c.y1 - roi_c.y0;
     int n = w * h;
@@ -197,6 +251,8 @@ static int find_all_blobs(const Frame *f, Rect roi_c, const ColorRef *bg,
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             int fy = roi_c.y0 + y, fx = roi_c.x0 + x;
+            if (quad_c != NULL && !point_in_quad((double)fx, (double)fy, quad_c))
+                continue; /* outside the true board quad -- can't be a bag */
             double du = (double)f->u[fy * CHROMA_W + fx] - bg->u_median;
             double dv = (double)f->v[fy * CHROMA_W + fx] - bg->v_median;
             double dist = sqrt(du * du + dv * dv);
@@ -317,12 +373,16 @@ int main(int argc, char **argv) {
     ColorRef bg = { .u_median = bg_u, .v_median = bg_v };
     ColorRef teamA = { .u_median = a_u, .v_median = a_v };
     ColorRef teamB = { .u_median = b_u, .v_median = b_v };
+    Pt corners_full[4], quad_c[4];
+    int have_quad = kv_get_corners(&kv, corners_full);
+    if (have_quad) quad_to_chroma(corners_full, quad_c);
 
     Frame f;
     if (load_frame(frame_path, &f) != 0) return 1;
 
     Blob blobs[MAX_BLOBS];
-    int count = find_all_blobs(&f, roi_c, &bg, bg_u_mad, bg_v_mad, blobs);
+    int count = find_all_blobs(&f, roi_c, have_quad ? quad_c : NULL,
+                                &bg, bg_u_mad, bg_v_mad, blobs);
     free_frame(&f);
     if (count < 0) return 1;
 

@@ -13,7 +13,7 @@
  *
  * Field workflow (three captures, in order):
  *   1. Empty board, no bags:
- *        calibrate_teams background frame_empty.yuv420 ROI_X0 ROI_Y0 ROI_X1 ROI_Y1 session.cal
+ *        calibrate_teams background frame_empty.yuv420 X0 Y0 X1 Y1 X2 Y2 X3 Y3 session.cal
  *   2. One Team A bag placed anywhere on the board:
  *        calibrate_teams team A frame_teamA.yuv420 session.cal
  *   3. One Team B bag placed anywhere on the board:
@@ -21,15 +21,23 @@
  *   4. Check the result:
  *        calibrate_teams validate session.cal
  *
- * ROI_X0/Y0/X1/Y1 are the board-interior corners in full-resolution
- * (Y-plane) pixel coordinates -- i.e. the same interior boundary that
- * border_detect already locates. Wire border_detect's output into step 1
- * instead of typing coordinates by hand once that hookup is convenient;
- * this tool takes a rectangle for now rather than assuming knowledge of
- * border_detect's exact data structure. A rectangular ROI is a safe
- * conservative choice: it should sit fully inside the true board
- * interior polygon so every sampled pixel is guaranteed to be board
- * surface or bag, never background outside the board.
+ * X0,Y0 .. X3,Y3 are the board's 4 interior corners, in full-resolution
+ * (Y-plane) pixel coordinates -- the same interior boundary that
+ * border_detect already locates -- given in order around the perimeter
+ * (clockwise or counter-clockwise, doesn't matter which, just don't
+ * cross them). Wire border_detect's output into step 1 instead of
+ * clicking coordinates by hand once that hookup is convenient. A
+ * photographed board is rarely axis-aligned in the raw frame (camera
+ * mount angle, perspective), so all 4 corners matter: collapsing to 2
+ * opposite corners of a bounding box -- the old behavior here --
+ * quietly stretches the sampled/scanned region away from the board's
+ * true shape, worse the further a point sits from wherever those 2
+ * corners happened to be. The tool still derives and stores that
+ * bounding box too (as roi_x0/y0/x1/y1), since it's a cheap, useful
+ * outer limit for iteration and for any older tooling that only reads
+ * the rectangle -- but background/bag sampling itself is now masked
+ * to the true quad, and detect_bags does the same for on-board
+ * scanning.
  *
  * Input frames: raw I420 YUV420 planar, WIDTH x HEIGHT, same format
  * everything else in this project reads off the FIFO. Grab one frame
@@ -104,6 +112,42 @@ typedef struct {
 typedef struct {
     int x0, y0, x1, y1; /* full-res (Y-plane) coordinates */
 } Rect;
+
+typedef struct {
+    double x, y;
+} Pt;
+
+/* Point-in-convex-quad test. `quad` is 4 points given in order around
+ * the perimeter (either winding direction, just not crossed/diagonal
+ * order) -- true for any real board's corners, however skewed by
+ * camera perspective, since a photographed rectangle is still convex.
+ * Works by checking the test point falls on the same side of every
+ * edge; a mismatched sign on any edge means it's outside. */
+static int point_in_quad(double px, double py, const Pt quad[4]) {
+    double sign = 0.0;
+    for (int i = 0; i < 4; i++) {
+        Pt a = quad[i], b = quad[(i + 1) % 4];
+        double ex = b.x - a.x, ey = b.y - a.y;
+        double cx = px - a.x, cy = py - a.y;
+        double cross = ex * cy - ey * cx;
+        if (i == 0) {
+            sign = cross;
+        } else if (cross * sign < 0.0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Same halving the ROI rect already does, applied to each quad corner
+ * so point_in_quad can be evaluated directly against chroma-plane
+ * pixel coordinates without re-scaling on every call. */
+static void quad_to_chroma(const Pt full[4], Pt chroma_out[4]) {
+    for (int i = 0; i < 4; i++) {
+        chroma_out[i].x = full[i].x / 2.0;
+        chroma_out[i].y = full[i].y / 2.0;
+    }
+}
 
 typedef struct {
     double u_median, v_median;
@@ -192,7 +236,8 @@ static Rect roi_to_chroma(Rect roi_yplane) {
 
 /* ---- Background sampling (whole ROI assumed to be board surface) ---- */
 
-static void sample_background(const Frame *f, Rect roi_c, ColorRef *out) {
+static void sample_background(const Frame *f, Rect roi_c, const Pt *quad_c,
+                               ColorRef *out) {
     int w = roi_c.x1 - roi_c.x0;
     int h = roi_c.y1 - roi_c.y0;
     int n = w * h;
@@ -206,13 +251,29 @@ static void sample_background(const Frame *f, Rect roi_c, ColorRef *out) {
     int idx = 0;
     for (int y = roi_c.y0; y < roi_c.y1; y++) {
         for (int x = roi_c.x0; x < roi_c.x1; x++) {
+            /* The bounding box is a safe outer limit for iteration, but
+             * for a board that isn't axis-aligned in the frame (camera
+             * perspective), its own corners can fall outside the true
+             * board quad -- skip those so a sliver of carpet/border
+             * near a bbox corner never drags the background median. */
+            if (quad_c != NULL && !point_in_quad((double)x, (double)y, quad_c))
+                continue;
             uvals[idx] = f->u[y * CHROMA_W + x];
             vvals[idx] = f->v[y * CHROMA_W + x];
             idx++;
         }
     }
-    median_and_mad(uvals, n, &out->u_median, &out->u_mad);
-    median_and_mad(vvals, n, &out->v_median, &out->v_mad);
+    if (idx == 0) {
+        fprintf(stderr,
+            "error: no pixels fell inside the board quad -- check the "
+            "corner order/coordinates\n");
+        out->has_data = 0;
+        free(uvals);
+        free(vvals);
+        return;
+    }
+    median_and_mad(uvals, idx, &out->u_median, &out->u_mad);
+    median_and_mad(vvals, idx, &out->v_median, &out->v_mad);
     free(uvals);
     free(vvals);
     out->has_data = 1;
@@ -221,7 +282,7 @@ static void sample_background(const Frame *f, Rect roi_c, ColorRef *out) {
 /* ---- Bag blob extraction: deviation mask + largest connected component ---- */
 
 static int find_bag_blob(const Frame *f, Rect roi_c, const ColorRef *bg,
-                          ColorRef *out) {
+                          const Pt *quad_c, ColorRef *out) {
     int w = roi_c.x1 - roi_c.x0;
     int h = roi_c.y1 - roi_c.y0;
     int n = w * h;
@@ -238,6 +299,8 @@ static int find_bag_blob(const Frame *f, Rect roi_c, const ColorRef *bg,
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             int fy = roi_c.y0 + y, fx = roi_c.x0 + x;
+            if (quad_c != NULL && !point_in_quad((double)fx, (double)fy, quad_c))
+                continue; /* outside the true board quad -- never a bag pixel */
             double du = (double)f->u[fy * CHROMA_W + fx] - bg->u_median;
             double dv = (double)f->v[fy * CHROMA_W + fx] - bg->v_median;
             double dist = sqrt(du * du + dv * dv);
@@ -360,6 +423,36 @@ static int kv_get(const KVStore *kv, const char *key, double *out) {
     return 0;
 }
 
+/* The board's true 4 corners (full-res Y-plane coords), in order
+ * around the perimeter -- as opposed to roi_x0/y0/x1/y1, which is
+ * just their bounding box, kept for any older tooling that only
+ * knows the rectangle. Returns 0 (and leaves out[] untouched) if a
+ * calibration file predates this and only has the bounding box --
+ * callers should treat that as "no quad available, fall back to the
+ * bbox" rather than an error. */
+static int kv_get_corners(const KVStore *kv, Pt out[4]) {
+    static const char *names[4][2] = {
+        {"roi_c0x", "roi_c0y"}, {"roi_c1x", "roi_c1y"},
+        {"roi_c2x", "roi_c2y"}, {"roi_c3x", "roi_c3y"},
+    };
+    for (int i = 0; i < 4; i++) {
+        if (!kv_get(kv, names[i][0], &out[i].x)) return 0;
+        if (!kv_get(kv, names[i][1], &out[i].y)) return 0;
+    }
+    return 1;
+}
+
+static void kv_set_corners(KVStore *kv, const Pt corners[4]) {
+    static const char *names[4][2] = {
+        {"roi_c0x", "roi_c0y"}, {"roi_c1x", "roi_c1y"},
+        {"roi_c2x", "roi_c2y"}, {"roi_c3x", "roi_c3y"},
+    };
+    for (int i = 0; i < 4; i++) {
+        kv_set(kv, names[i][0], corners[i].x);
+        kv_set(kv, names[i][1], corners[i].y);
+    }
+}
+
 static void kv_load(KVStore *kv, const char *path) {
     kv->count = 0;
     FILE *fp = fopen(path, "r");
@@ -420,37 +513,95 @@ static double chroma_distance(const ColorRef *a, const ColorRef *b) {
 
 /* ---- Subcommands ---- */
 
+/* Detects a self-intersecting ("bowtie") corner order -- e.g. entering
+ * TL,TR,BL,BR instead of walking the perimeter TL,TR,BR,BL -- which
+ * point_in_quad can't interpret as a simple interior/exterior split.
+ * Checks that every consecutive pair of edges turns the same
+ * direction (all cross products the same sign); a valid quad, walked
+ * consistently clockwise or counter-clockwise, always does. */
+static int quad_is_simple(const Pt q[4]) {
+    double sign = 0.0;
+    for (int i = 0; i < 4; i++) {
+        Pt a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4];
+        double e1x = b.x - a.x, e1y = b.y - a.y;
+        double e2x = c.x - b.x, e2y = c.y - b.y;
+        double turn = e1x * e2y - e1y * e2x;
+        if (i == 0) {
+            sign = turn;
+        } else if (turn * sign < 0.0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int cmd_background(int argc, char **argv) {
-    if (argc != 8) {
+    if (argc != 12) {
         fprintf(stderr,
             "usage: calibrate_teams background <frame.yuv420> "
-            "<roi_x0> <roi_y0> <roi_x1> <roi_y1> <calib_file>\n"
-            "  roi_* are full-resolution (Y-plane) pixel coordinates of a "
-            "rectangle that sits safely inside the board interior.\n");
+            "<x0> <y0> <x1> <y1> <x2> <y2> <x3> <y3> <calib_file>\n"
+            "  x0,y0 .. x3,y3 are the board's 4 interior corners, in "
+            "full-resolution (Y-plane) pixel coordinates, given in order "
+            "around the perimeter (clockwise or counter-clockwise -- just "
+            "not crossed). A rectangle photographed off-axis is still a "
+            "convex quad, so all 4 corners matter even if the board looks "
+            "trapezoidal in the raw frame; don't collapse it to 2 opposite "
+            "corners of a bounding box.\n");
         return 1;
     }
     const char *frame_path = argv[2];
-    Rect roi_y = {
-        .x0 = atoi(argv[3]), .y0 = atoi(argv[4]),
-        .x1 = atoi(argv[5]), .y1 = atoi(argv[6])
+    Pt corners_full[4] = {
+        { atof(argv[3]),  atof(argv[4])  },
+        { atof(argv[5]),  atof(argv[6])  },
+        { atof(argv[7]),  atof(argv[8])  },
+        { atof(argv[9]),  atof(argv[10]) },
     };
-    const char *calib_path = argv[7];
+    const char *calib_path = argv[11];
+
+    if (!quad_is_simple(corners_full)) {
+        fprintf(stderr,
+            "error: these 4 corners cross over themselves (a 'bowtie'), "
+            "not a simple board outline -- most likely two of them are "
+            "out of order. Walk the perimeter in one direction, e.g. "
+            "top-left, top-right, bottom-right, bottom-left -- don't "
+            "jump diagonally (top-left, top-right, bottom-LEFT, "
+            "bottom-right is the mistake this usually is).\n");
+        return 1;
+    }
+
+    Rect roi_y = {
+        .x0 = (int)corners_full[0].x, .y0 = (int)corners_full[0].y,
+        .x1 = (int)corners_full[0].x, .y1 = (int)corners_full[0].y,
+    };
+    for (int i = 1; i < 4; i++) {
+        if (corners_full[i].x < roi_y.x0) roi_y.x0 = (int)corners_full[i].x;
+        if (corners_full[i].x > roi_y.x1) roi_y.x1 = (int)corners_full[i].x;
+        if (corners_full[i].y < roi_y.y0) roi_y.y0 = (int)corners_full[i].y;
+        if (corners_full[i].y > roi_y.y1) roi_y.y1 = (int)corners_full[i].y;
+    }
 
     Frame f;
     if (load_frame(frame_path, &f) != 0) return 1;
 
     Rect roi_c = roi_to_chroma(roi_y);
+    Pt quad_c[4];
+    quad_to_chroma(corners_full, quad_c);
     ColorRef bg;
-    sample_background(&f, roi_c, &bg);
+    sample_background(&f, roi_c, quad_c, &bg);
     free_frame(&f);
     if (!bg.has_data) return 1;
 
     KVStore kv;
     kv_load(&kv, calib_path); /* start fresh or reuse existing file if present */
+    /* Bounding box: kept for any tooling that only reads the rectangle
+     * and for iteration bounds; it's derived from the true corners
+     * below, not independently entered, so it can never drift out of
+     * sync with them the way it could when both were typed by hand. */
     kv_set(&kv, "roi_x0", roi_y.x0);
     kv_set(&kv, "roi_y0", roi_y.y0);
     kv_set(&kv, "roi_x1", roi_y.x1);
     kv_set(&kv, "roi_y1", roi_y.y1);
+    kv_set_corners(&kv, corners_full);
     colorref_to_kv(&kv, "bg", &bg);
     kv_save(&kv, calib_path);
 
@@ -498,12 +649,15 @@ static int cmd_team(int argc, char **argv) {
 
     Rect roi_y = { .x0 = (int)rx0, .y0 = (int)ry0, .x1 = (int)rx1, .y1 = (int)ry1 };
     Rect roi_c = roi_to_chroma(roi_y);
+    Pt corners_full[4], quad_c[4];
+    int have_quad = kv_get_corners(&kv, corners_full);
+    if (have_quad) quad_to_chroma(corners_full, quad_c);
 
     Frame f;
     if (load_frame(frame_path, &f) != 0) return 1;
 
     ColorRef bag;
-    int rc = find_bag_blob(&f, roi_c, &bg, &bag);
+    int rc = find_bag_blob(&f, roi_c, &bg, have_quad ? quad_c : NULL, &bag);
     free_frame(&f);
     if (rc != 0) {
         fprintf(stderr,
@@ -611,10 +765,23 @@ static int cmd_hole(int argc, char **argv) {
 
     /* Sanity check against the ROI if one is already set, since the hole
      * should sit inside the board interior the ROI was drawn from. This is
-     * just a warning -- the ROI rectangle is deliberately conservative and
-     * may not itself reach all the way to the hole, so it's not an error. */
+     * just a warning -- the ROI is deliberately conservative and may not
+     * itself reach all the way to the hole, so it's not an error. Prefer
+     * the true quad when the calibration file has one; it's a tighter,
+     * more accurate check than the bounding box for a board that isn't
+     * axis-aligned in the frame. */
     double rx0, ry0, rx1, ry1;
-    if (kv_get(&kv, "roi_x0", &rx0) && kv_get(&kv, "roi_y0", &ry0) &&
+    Pt corners_full[4];
+    int have_quad = kv_get_corners(&kv, corners_full);
+    if (have_quad) {
+        if (!point_in_quad(cx, cy, corners_full)) {
+            fprintf(stderr,
+                "note: hole center (%.0f, %.0f) falls outside the calibrated "
+                "board quad. That's fine if the ROI is drawn conservatively "
+                "away from the hole -- just confirm the hole coordinates "
+                "themselves are right.\n", cx, cy);
+        }
+    } else if (kv_get(&kv, "roi_x0", &rx0) && kv_get(&kv, "roi_y0", &ry0) &&
         kv_get(&kv, "roi_x1", &rx1) && kv_get(&kv, "roi_y1", &ry1)) {
         if (cx < rx0 || cx > rx1 || cy < ry0 || cy > ry1) {
             fprintf(stderr,
@@ -638,7 +805,7 @@ static int cmd_hole(int argc, char **argv) {
 static void print_top_usage(const char *prog) {
     fprintf(stderr,
         "usage:\n"
-        "  %s background <frame.yuv420> <roi_x0> <roi_y0> <roi_x1> <roi_y1> <calib_file>\n"
+        "  %s background <frame.yuv420> <x0> <y0> <x1> <y1> <x2> <y2> <x3> <y3> <calib_file>\n"
         "  %s team <A|B> <frame.yuv420> <calib_file>\n"
         "  %s hole <cx> <cy> <radius> <calib_file>\n"
         "  %s validate <calib_file>\n",

@@ -62,6 +62,21 @@ def load_roi_and_hole(calib_path: str) -> dict:
         "x0": int(values["roi_x0"]), "y0": int(values["roi_y0"]),
         "x1": int(values["roi_x1"]), "y1": int(values["roi_y1"]),
     }
+    corner_keys = ["roi_c0x", "roi_c0y", "roi_c1x", "roi_c1y",
+                   "roi_c2x", "roi_c2y", "roi_c3x", "roi_c3y"]
+    if all(k in values for k in corner_keys):
+        roi["corners"] = [
+            (values["roi_c0x"], values["roi_c0y"]),
+            (values["roi_c1x"], values["roi_c1y"]),
+            (values["roi_c2x"], values["roi_c2y"]),
+            (values["roi_c3x"], values["roi_c3y"]),
+        ]
+    else:
+        roi["corners"] = None
+        print("warning: no 4-corner calibration found -- board SVG will use "
+              "the older, less accurate bounding-box mapping. Recalibrate "
+              "with calibrate_teams's updated 'background' step (now takes "
+              "4 corners instead of 2) to fix this.", file=sys.stderr)
     if all(k in values for k in ("hole_cx", "hole_cy", "hole_radius")):
         roi["hole_cx"] = int(values["hole_cx"])
         roi["hole_cy"] = int(values["hole_cy"])
