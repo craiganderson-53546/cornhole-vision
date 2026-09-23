@@ -58,10 +58,19 @@
 #define FRAME_SIZE (Y_SIZE + 2 * UV_SIZE)
 
 /* Same deviation/blob-size tuning as calibrate_teams -- keep these two
- * files in sync if you retune one of them. */
+ * files in sync if you retune one of them. Lower than calibrate_teams'
+ * copy on purpose: detect_bags only ever scans the true calibrated
+ * interior (never tape/carpet -- see the interior-only quad mask
+ * below), so every deviant pixel it finds is already known-trustworthy
+ * board-or-bag color. That makes it safe to accept a smaller blob here
+ * than during calibration, which is what lets a bag resting mostly off
+ * the true edge -- with only a modest on-board sliver -- still clear
+ * the threshold instead of vanishing entirely. If this catches noise
+ * (shadow, glare) that shouldn't count, raise it in small steps and
+ * retest rather than jumping back to calibrate_teams' larger value. */
 #define DEVIATION_MAD_MULTIPLIER 4.0
 #define DEVIATION_FLOOR          8.0
-#define MIN_BLOB_AREA_FRACTION   0.01
+#define MIN_BLOB_AREA_FRACTION   0.004
 
 typedef struct {
     uint8_t *y, *u, *v;
@@ -252,7 +261,7 @@ static int find_all_blobs(const Frame *f, Rect roi_c, const Pt *quad_c,
         for (int x = 0; x < w; x++) {
             int fy = roi_c.y0 + y, fx = roi_c.x0 + x;
             if (quad_c != NULL && !point_in_quad((double)fx, (double)fy, quad_c))
-                continue; /* outside the true board quad -- can't be a bag */
+                continue; /* outside the (padded) board region -- can't be a bag */
             double du = (double)f->u[fy * CHROMA_W + fx] - bg->u_median;
             double dv = (double)f->v[fy * CHROMA_W + fx] - bg->v_median;
             double dist = sqrt(du * du + dv * dv);
