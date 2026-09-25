@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 from game_engine import GameEngine, parse_detect_bags_output, build_html
 
@@ -153,7 +154,22 @@ def make_handler(engine: GameEngine, roi: dict):
             pass  # keep stdout quiet; rely on the poll loop's own warnings
 
         def do_GET(self):
-            if self.path == "/" or self.path == "":
+            parsed = urlparse(self.path)
+            path = parsed.path
+            q = parse_qs(parsed.query)
+
+            def redirect_home():
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.end_headers()
+
+            def qint(name, default=None):
+                try:
+                    return int(q[name][0])
+                except (KeyError, ValueError, IndexError):
+                    return default
+
+            if path == "/" or path == "":
                 state = engine.snapshot()
                 html = build_html(state, roi)
                 body = html.encode("utf-8")
@@ -162,12 +178,45 @@ def make_handler(engine: GameEngine, roi: dict):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-            elif self.path == "/newgame":
+            elif path == "/newgame":
                 engine.new_game()
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.end_headers()
-            elif self.path == "/favicon.ico":
+                redirect_home()
+            elif path == "/edit/delete":
+                bag_id = qint("id")
+                if bag_id is not None:
+                    engine.edit_delete_bag(bag_id)
+                redirect_home()
+            elif path == "/edit/team":
+                bag_id = qint("id")
+                if bag_id is not None:
+                    engine.edit_toggle_team(bag_id)
+                redirect_home()
+            elif path == "/edit/hole":
+                bag_id = qint("id")
+                if bag_id is not None:
+                    engine.edit_toggle_in_hole(bag_id)
+                redirect_home()
+            elif path == "/edit/add":
+                team = q.get("team", [""])[0]
+                in_hole = q.get("hole", ["0"])[0] == "1"
+                # No real camera reading for a manually-added bag --
+                # place it at the hole center if marked in-hole, or the
+                # board's rough middle otherwise, purely so it shows up
+                # somewhere sensible on the board diagram.
+                if in_hole and roi.get("hole_cx") is not None:
+                    cx, cy = roi["hole_cx"], roi["hole_cy"]
+                else:
+                    cx = (roi["x0"] + roi["x1"]) // 2
+                    cy = (roi["y0"] + roi["y1"]) // 2
+                engine.edit_add_bag(team, in_hole, cx, cy)
+                redirect_home()
+            elif path == "/edit/score":
+                score_a = qint("score_a")
+                score_b = qint("score_b")
+                if score_a is not None and score_b is not None:
+                    engine.set_score(score_a, score_b)
+                redirect_home()
+            elif path == "/favicon.ico":
                 self.send_response(204)
                 self.end_headers()
             else:

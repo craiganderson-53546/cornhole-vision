@@ -282,7 +282,7 @@ static void sample_background(const Frame *f, Rect roi_c, const Pt *quad_c,
 /* ---- Bag blob extraction: deviation mask + largest connected component ---- */
 
 static int find_bag_blob(const Frame *f, Rect roi_c, const ColorRef *bg,
-                          const Pt *quad_c, ColorRef *out) {
+                          const Pt *quad_c, ColorRef *out, int *area_out) {
     int w = roi_c.x1 - roi_c.x0;
     int h = roi_c.y1 - roi_c.y0;
     int n = w * h;
@@ -373,6 +373,7 @@ static int find_bag_blob(const Frame *f, Rect roi_c, const ColorRef *bg,
         free(uvals);
         free(vvals);
         out->has_data = 1;
+        if (area_out != NULL) *area_out = best_size;
         fprintf(stderr, "info: bag blob found, %d px (%.1f%% of ROI)\n",
                 best_size, 100.0 * best_size / n);
         result = 0;
@@ -657,7 +658,8 @@ static int cmd_team(int argc, char **argv) {
     if (load_frame(frame_path, &f) != 0) return 1;
 
     ColorRef bag;
-    int rc = find_bag_blob(&f, roi_c, &bg, have_quad ? quad_c : NULL, &bag);
+    int bag_area = 0;
+    int rc = find_bag_blob(&f, roi_c, &bg, have_quad ? quad_c : NULL, &bag, &bag_area);
     free_frame(&f);
     if (rc != 0) {
         fprintf(stderr,
@@ -669,10 +671,20 @@ static int cmd_team(int argc, char **argv) {
     char prefix[8];
     snprintf(prefix, sizeof(prefix), "team%s", team);
     colorref_to_kv(&kv, prefix, &bag);
+    /* This single bag's pixel area becomes the reference detect_bags
+     * uses to tell "one bag" from "two or three touching bags flood-
+     * filled into one blob" -- see MAX_BLOB_AREA handling there. Place
+     * the calibration bag flat and by itself, same as for color, or
+     * this reference (and every split it drives) will be off. */
+    char area_key[16];
+    snprintf(area_key, sizeof(area_key), "team%s_ref_area", team);
+    kv_set(&kv, area_key, (double)bag_area);
     kv_save(&kv, calib_path);
 
     printf("Team %s: U median=%.1f (MAD %.1f)  V median=%.1f (MAD %.1f)\n",
            team, bag.u_median, bag.u_mad, bag.v_median, bag.v_mad);
+    printf("single-bag reference area: %d px -- used to detect touching/"
+           "overlapping bags of the same color.\n", bag_area);
     printf("saved to '%s'.\n", calib_path);
     return 0;
 }

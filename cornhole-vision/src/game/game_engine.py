@@ -141,6 +141,11 @@ class GameEngine:
         self._next_id = 1
         self._pending_add: Dict[Tuple[str, int, int], dict] = {}
         self._missing_streak: Dict[int, int] = {}
+        # Positions New Game found still physically on the board at
+        # reset time -- ignored as "new throws" until each one is
+        # actually picked up, so leftover bags from a prior round
+        # don't get silently re-counted the moment polling resumes.
+        self._ignore_baseline: List[Tuple[str, int, int]] = []
 
     def snapshot(self) -> GameState:
         """Returns a shallow copy safe to read from another thread
@@ -166,17 +171,125 @@ class GameEngine:
     def new_game(self) -> None:
         """Hard reset from the web UI's New Game button -- discards
         any round in progress and zeroes accumulated scores, same as
-        the ESP32 version's handleNewGame()."""
+        the ESP32 version's handleNewGame(). Also remembers any bag
+        still physically on the board right now as a leftover, so the
+        next poll doesn't immediately re-count it as a fresh throw --
+        that position only counts again once it's actually picked up
+        (see _match_existing)."""
         with self._lock:
             self.state.score_a = 0
             self.state.score_b = 0
+            self._ignore_baseline = [
+                (b.team, b.cx, b.cy) for b in self.state.bags if b.active
+            ]
             self._reset_round()
             self.state.status_msg = "New game started."
+
+    # ── manual corrections ──────────────────────────────────────────
+    # Camera-based edge/hole detection will occasionally misread in
+    # real use -- these exist so a wrong call can be fixed by hand
+    # from the web UI rather than requiring a round restart.
+
+    def edit_delete_bag(self, bag_id: int) -> bool:
+        """Undoes a bag entirely -- for a false positive (the camera
+        saw a bag at the edge or hole that was never really there).
+        Unlike a normal removal (bag picked up, physically -- which
+        still counts toward the round's score, see _score_round),
+        a deleted bag is wiped from history as if it never happened,
+        including out of total_thrown."""
+        with self._lock:
+            for i, bag in enumerate(self.state.bags):
+                if bag.id == bag_id:
+                    if bag.active:
+                        self.state.bag_count -= 1
+                    self.state.total_thrown -= 1
+                    del self.state.bags[i]
+                    self._missing_streak.pop(bag_id, None)
+                    self.state.status_msg = f"Bag {bag_id} deleted (correction)."
+                    return True
+            return False
+
+    def edit_toggle_team(self, bag_id: int) -> bool:
+        """For a bag the camera classified as the wrong team."""
+        with self._lock:
+            for bag in self.state.bags:
+                if bag.id == bag_id:
+                    bag.team = 'B' if bag.team == 'A' else 'A'
+                    self.state.status_msg = (
+                        f"Bag {bag_id} team corrected to "
+                        f"{TEAM_DISPLAY[bag.team]['name']}."
+                    )
+                    return True
+            return False
+
+    def edit_toggle_in_hole(self, bag_id: int) -> bool:
+        """For a bag the camera missed going in the hole, or wrongly
+        called in the hole when it was actually just on the board."""
+        with self._lock:
+            for bag in self.state.bags:
+                if bag.id == bag_id:
+                    bag.in_hole = not bag.in_hole
+                    self.state.status_msg = (
+                        f"Bag {bag_id} corrected to "
+                        f"{'in the hole' if bag.in_hole else 'on the board'}."
+                    )
+                    return True
+            return False
+
+    def edit_add_bag(self, team: str, in_hole: bool, cx: int, cy: int) -> Optional[int]:
+        """Manually records a bag the camera missed entirely -- the
+        counterpart to edit_delete_bag's false positive. cx/cy are a
+        placeholder position (the caller doesn't have a real camera
+        reading for it); the board diagram will show it there, but
+        nothing else depends on the position being exact."""
+        if team not in ('A', 'B'):
+            return None
+        with self._lock:
+            if sum(1 for b in self.state.bags if b.active) >= MAX_BAGS:
+                return None
+            bag = Bag(id=self._next_id, team=team, in_hole=in_hole,
+                      cx=cx, cy=cy, active=True)
+            self._next_id += 1
+            self.state.bags.append(bag)
+            self.state.bag_count += 1
+            self.state.total_thrown += 1
+            self.state.status_msg = f"Bag {bag.id} added manually (correction)."
+            return bag.id
+
+    def set_score(self, score_a: int, score_b: int) -> None:
+        """Directly overrides the cumulative score -- for fixing a
+        round that already auto-scored (and reset) before a bad
+        team/hole call was noticed, since individual round history
+        isn't kept separately from the running total."""
+        with self._lock:
+            self.state.score_a = max(0, score_a)
+            self.state.score_b = max(0, score_b)
+            self.state.status_msg = "Score corrected manually."
 
     # ── internals ────────────────────────────────────────────────
 
     def _match_existing(self, raw: List[BlobReading]) -> None:
+        if self._ignore_baseline:
+            # A baseline entry is retired the moment nothing near it is
+            # detected anymore -- i.e. it's actually been picked up.
+            # After that, a bag landing in that same spot again counts
+            # normally; this is a one-time "don't re-count what was
+            # already there" guard, not a permanent dead zone.
+            self._ignore_baseline = [
+                (team, bx, by) for (team, bx, by) in self._ignore_baseline
+                if any(r.team == team and
+                       ((r.cx - bx) ** 2 + (r.cy - by) ** 2) ** 0.5 < MATCH_DISTANCE_PX
+                       for r in raw)
+            ]
+
         unmatched = list(raw)
+        if self._ignore_baseline:
+            unmatched = [
+                r for r in unmatched
+                if not any(r.team == team and
+                           ((r.cx - bx) ** 2 + (r.cy - by) ** 2) ** 0.5 < MATCH_DISTANCE_PX
+                           for (team, bx, by) in self._ignore_baseline)
+            ]
         # Whether *anything* is currently sitting in the hole, regardless
         # of which bag it belongs to. Used below to tell "this hole bag
         # is just covered by a later bag" apart from "the hole is
@@ -469,20 +582,59 @@ def build_html(state: GameState, roi: dict) -> str:
         row_style = "" if b.active else " style='opacity:0.35;text-decoration:line-through'"
         result = ("<td style='color:#f0b429;font-weight:bold'>HOLE &mdash; 3 pts</td>"
                    if b.in_hole else "<td>Board &mdash; 1 pt</td>")
+        edit_links = (
+            f"<td class='editcell'>"
+            f"<a href='/edit/team?id={b.id}' class='elink'>team</a>"
+            f"<a href='/edit/hole?id={b.id}' class='elink'>hole</a>"
+            f"<a href='/edit/delete?id={b.id}' class='elink del' "
+            f"onclick=\"return confirmNav('Delete bag {b.id}? This removes it "
+            f"from the round entirely, not just the board.')\">del</a>"
+            f"</td>"
+        )
         rows.append(
             f"<tr{row_style}><td>{b.id}{'' if b.active else ' &#10007;'}</td>"
             f"<td style='color:{disp['fill']};font-weight:bold'>{disp['name']}</td>"
-            f"{result}</tr>"
+            f"{result}{edit_links}</tr>"
         )
     bag_rows_html = "".join(rows) if rows else \
-        "<tr><td colspan='3' class='empty'>No bags thrown yet</td></tr>"
+        "<tr><td colspan='4' class='empty'>No bags thrown yet</td></tr>"
 
     board_svg = build_board_svg(state, roi)
 
     return f"""<!DOCTYPE html><html lang='en'><head>
 <meta charset='UTF-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1.0'>
-<meta http-equiv='refresh' content='2'>
+<script>
+// Plain meta-refresh reloads the page on a fixed timer no matter what
+// the user is doing -- which was yanking the page out from under an
+// open <select> dropdown or a confirm() dialog before there was time
+// to respond. This does the same auto-refresh, but pauses it while
+// any form field has focus and while a confirm() is up, resuming
+// only if the user cancels (a confirmed action navigates away on its
+// own, so there's nothing to resume for).
+var REFRESH_MS = 4000;
+var refreshTimer = null;
+function scheduleRefresh() {{
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(function() {{ location.reload(); }}, REFRESH_MS);
+}}
+function pauseRefresh() {{
+    if (refreshTimer) {{ clearTimeout(refreshTimer); refreshTimer = null; }}
+}}
+function confirmNav(msg) {{
+    pauseRefresh();
+    var ok = confirm(msg);
+    if (!ok) scheduleRefresh();
+    return ok;
+}}
+window.addEventListener('DOMContentLoaded', function() {{
+    scheduleRefresh();
+    document.querySelectorAll('select, input').forEach(function(el) {{
+        el.addEventListener('focus', pauseRefresh);
+        el.addEventListener('blur', scheduleRefresh);
+    }});
+}});
+</script>
 <title>Cornhole Scorer</title><style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -539,9 +691,26 @@ border:2px solid #e94560;border-radius:10px;cursor:pointer;
 letter-spacing:1px;text-align:center;text-decoration:none;
 -webkit-tap-highlight-color:transparent}}
 .btn-newgame:active{{background:#e94560;color:#fff}}
+.editcell{{white-space:nowrap}}
+.elink{{display:inline-block;font-size:0.68rem;color:#6a86b5;
+text-decoration:none;padding:2px 5px;margin:0 1px;border:1px solid #2a3f66;
+border-radius:5px}}
+.elink:active{{background:#2a3f66}}
+.elink.del{{color:#e97b8f;border-color:#5a2530}}
+.editbox{{background:#16213e;border-radius:10px;padding:10px 12px;
+margin-bottom:10px}}
+.editlbl{{font-size:0.68rem;color:#888;margin-bottom:7px;letter-spacing:0.5px}}
+.editrow{{display:flex;gap:6px;align-items:center;flex-wrap:wrap}}
+.editrow select,.editrow input[type=number]{{background:#0f1b32;color:#eee;
+border:1px solid #2a3f66;border-radius:6px;padding:6px 7px;font-size:0.85rem}}
+.editrow label{{font-size:0.8rem;color:#ccc;display:flex;align-items:center;gap:4px}}
+.editrow button{{background:#0f3460;color:#eee;border:1px solid #2a3f66;
+border-radius:6px;padding:6px 12px;font-size:0.8rem;cursor:pointer}}
+.editrow button:active{{background:#2a3f66}}
+.editrow .sep{{color:#555}}
 </style></head><body>
 <h1>&#127919; Cornhole Scorer</h1>
-<p class='sub'>Auto-refreshes every 2 seconds</p>
+<p class='sub'>Auto-refreshes every 4 seconds (pauses while you're editing)</p>
 <div class='scoreboard'>
 <div class='score-team'><div class='score-name {cls_a}'>{disp_a['name']}</div>
 <div class='score-val {cls_a}'>{state.score_a}</div></div>
@@ -571,9 +740,29 @@ letter-spacing:1px;text-align:center;text-decoration:none;
 <span><span class='dot-hole'></span>Hole (3pts)</span>
 <span><span class='dot-off'></span>Removed</span>
 </div></div>
-<table><thead><tr><th>#</th><th>Team</th><th>Score</th></tr></thead>
+<table><thead><tr><th>#</th><th>Team</th><th>Score</th><th>Edit</th></tr></thead>
 <tbody>{bag_rows_html}</tbody></table>
+<div class='editbox'>
+<div class='editlbl'>ADD A BAG THE CAMERA MISSED</div>
+<form method='get' action='/edit/add' class='editrow'>
+<select name='team'>
+<option value='A'>{disp_a['name']}</option>
+<option value='B'>{disp_b['name']}</option>
+</select>
+<label><input type='checkbox' name='hole' value='1'> in hole</label>
+<button type='submit'>Add</button>
+</form>
+</div>
+<div class='editbox'>
+<div class='editlbl'>CORRECT TOTAL SCORE</div>
+<form method='get' action='/edit/score' class='editrow'>
+<input type='number' name='score_a' value='{state.score_a}' min='0' style='width:60px'>
+<span class='sep'>&ndash;</span>
+<input type='number' name='score_b' value='{state.score_b}' min='0' style='width:60px'>
+<button type='submit'>Save</button>
+</form>
+</div>
 <p class='status'>{state.status_msg}</p>
 <a href='/newgame' class='btn-newgame'
-onclick="return confirm('Reset scores and start a new game?')">&#9654; NEW GAME</a>
+onclick="return confirmNav('Reset scores and start a new game?')">&#9654; NEW GAME</a>
 </body></html>"""

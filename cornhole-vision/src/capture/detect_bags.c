@@ -24,6 +24,13 @@
  * frame rather than a rectangle that's only approximately right for a
  * board photographed at an angle.
  *
+ * Same-team bags touching or overlapping flood-fill into a single
+ * connected blob; if calibrate_teams has recorded that team's single-
+ * bag reference area, an oversized blob is split back into that many
+ * separate bags along its own principal axis (see find_all_blobs) --
+ * an older calibration file without that reference just reports the
+ * merged blob as one bag, same as before this existed.
+ *
  * Output (one line per bag found, to stdout):
  *   bag team=A in_hole=0 cx=612 cy=430 area=812
  *   bag team=B in_hole=1 cx=780 cy=415 area=790
@@ -233,16 +240,38 @@ static int kv_require(const KVStore *kv, const char *key, double *out,
 /* ---- Blob finding: deviation mask + ALL connected components ---- */
 
 typedef struct {
-    ColorRef color;   /* median U/V of the blob */
+    ColorRef color;   /* median U/V of the blob (or sub-blob, if split) */
+    char team;
     int cx_full, cy_full; /* centroid, full-res Y-plane coordinates */
     int area;         /* pixel count, chroma-plane */
 } Blob;
 
 #define MAX_BLOBS 32
 
-/* Returns the number of blobs found (up to MAX_BLOBS), or -1 on error. */
+/* How many bags a single flood-filled blob is allowed to be split
+ * into. Bounded low on purpose -- splitting gets less reliable the
+ * more bags are jammed together (the principal-axis approach below
+ * assumes something close to a line of bags, not a 2D cluster), and
+ * MAX_BAGS_PER_BLOB caps how far to trust it rather than guessing
+ * wildly for a large stuck-together mass. */
+#define MAX_BAGS_PER_BLOB 4
+
+static char classify_team(double u, double v, const ColorRef *teamA,
+                           const ColorRef *teamB) {
+    double da = hypot(u - teamA->u_median, v - teamA->v_median);
+    double db = hypot(u - teamB->u_median, v - teamB->v_median);
+    return (da <= db) ? 'A' : 'B';
+}
+
+/* Returns the number of blobs found (up to MAX_BLOBS), or -1 on error.
+ * teamA_ref_area/teamB_ref_area are each team's single-bag pixel area
+ * from calibration (0.0 if that calibration file predates this and
+ * doesn't have one -- splitting is simply skipped for that team in
+ * that case, same as the old single-blob-only behavior). */
 static int find_all_blobs(const Frame *f, Rect roi_c, const Pt *quad_c,
                            const ColorRef *bg, double bg_u_mad, double bg_v_mad,
+                           const ColorRef *teamA, const ColorRef *teamB,
+                           double teamA_ref_area, double teamB_ref_area,
                            Blob *blobs_out) {
     int w = roi_c.x1 - roi_c.x0;
     int h = roi_c.y1 - roi_c.y0;
@@ -321,13 +350,117 @@ static int find_all_blobs(const Frame *f, Rect roi_c, const Pt *quad_c,
          * a plain mean over the whole blob is fine for that -- the
          * outlier-robustness that matters (rejecting noise pixels) is
          * already handled by keeping only labeled blob members. */
-        blobs_out[found].color.u_median = (double)u_sum / count;
-        blobs_out[found].color.v_median = (double)v_sum / count;
-        /* centroid in chroma-plane, then to full-res by *2 */
-        blobs_out[found].cx_full = (int)((double)x_sum / count) * 2;
-        blobs_out[found].cy_full = (int)((double)y_sum / count) * 2;
-        blobs_out[found].area = count;
-        found++;
+        double u_mean = (double)u_sum / count;
+        double v_mean = (double)v_sum / count;
+        double cx_mean = (double)x_sum / count; /* chroma-plane, float */
+        double cy_mean = (double)y_sum / count;
+
+        char team = classify_team(u_mean, v_mean, teamA, teamB);
+        /* For deciding *how many* bags this is, use whichever
+         * reference(s) are available rather than trusting this blob's
+         * own team guess -- for two different-team bags overlapping,
+         * the blended average color isn't reliably close to either
+         * team's reference, so it's not a good basis for picking
+         * which one's ref_area to trust. Physical bags are the same
+         * size regardless of team, so averaging both when available
+         * is a better estimate than committing to one guess. */
+        double ref_area;
+        if (teamA_ref_area > 0.0 && teamB_ref_area > 0.0) {
+            ref_area = (teamA_ref_area + teamB_ref_area) / 2.0;
+        } else {
+            ref_area = (teamA_ref_area > 0.0) ? teamA_ref_area : teamB_ref_area;
+        }
+
+        int n_bags = 1;
+        if (ref_area > 0.0) {
+            n_bags = (int)(sizes[l] / ref_area + 0.5); /* round to nearest */
+            if (n_bags < 1) n_bags = 1;
+            if (n_bags > MAX_BAGS_PER_BLOB) n_bags = MAX_BAGS_PER_BLOB;
+        }
+
+        if (n_bags <= 1) {
+            blobs_out[found].team = team;
+            blobs_out[found].color.u_median = u_mean;
+            blobs_out[found].color.v_median = v_mean;
+            blobs_out[found].cx_full = (int)cx_mean * 2;
+            blobs_out[found].cy_full = (int)cy_mean * 2;
+            blobs_out[found].area = sizes[l];
+            found++;
+            continue;
+        }
+
+        /* This blob is roughly n_bags worth of pixels -- almost
+         * certainly several same-team bags touching or overlapping,
+         * flood-filled into one component. Split it back apart along
+         * its own principal axis: compute the axis the blob is
+         * elongated along (via its 2nd-moment/covariance, same idea
+         * as an object's major axis in image-moment analysis), then
+         * bucket its pixels into n_bags groups by how far along that
+         * axis each one projects. This works well for bags placed in
+         * a rough line (touching corner-to-corner or edge-to-edge,
+         * the common case) and is deliberately simple rather than a
+         * full watershed segmentation -- there's no OpenCV here, and
+         * an approximate per-bag centroid is enough for scoring. */
+        double Sxx = 0.0, Syy = 0.0, Sxy = 0.0;
+        for (int i = 0; i < n; i++) {
+            if (label[i] != l) continue;
+            int y = i / w, x = i % w;
+            double dx = x - cx_mean, dy = y - cy_mean;
+            Sxx += dx * dx;
+            Syy += dy * dy;
+            Sxy += dx * dy;
+        }
+        double theta = 0.5 * atan2(2.0 * Sxy, Sxx - Syy);
+        double ax = cos(theta), ay = sin(theta);
+
+        double tmin = 1e18, tmax = -1e18;
+        for (int i = 0; i < n; i++) {
+            if (label[i] != l) continue;
+            int y = i / w, x = i % w;
+            double t = (x - cx_mean) * ax + (y - cy_mean) * ay;
+            if (t < tmin) tmin = t;
+            if (t > tmax) tmax = t;
+        }
+        double span = tmax - tmin;
+        if (span < 1e-6) span = 1e-6;
+
+        double bin_fx[MAX_BAGS_PER_BLOB] = {0}, bin_fy[MAX_BAGS_PER_BLOB] = {0};
+        double bin_u[MAX_BAGS_PER_BLOB] = {0}, bin_v[MAX_BAGS_PER_BLOB] = {0};
+        int bin_n[MAX_BAGS_PER_BLOB] = {0};
+        for (int i = 0; i < n; i++) {
+            if (label[i] != l) continue;
+            int y = i / w, x = i % w;
+            int fy = roi_c.y0 + y, fx = roi_c.x0 + x;
+            double t = (x - cx_mean) * ax + (y - cy_mean) * ay;
+            int bin = (int)(((t - tmin) / span) * n_bags);
+            if (bin >= n_bags) bin = n_bags - 1;
+            if (bin < 0) bin = 0;
+            bin_fx[bin] += fx;
+            bin_fy[bin] += fy;
+            bin_u[bin] += f->u[fy * CHROMA_W + fx];
+            bin_v[bin] += f->v[fy * CHROMA_W + fx];
+            bin_n[bin]++;
+        }
+        for (int b = 0; b < n_bags && found < MAX_BLOBS; b++) {
+            if (bin_n[b] == 0) continue; /* degenerate split, skip */
+            double bu = bin_u[b] / bin_n[b], bv = bin_v[b] / bin_n[b];
+            /* Reclassify from this piece's OWN average color, not the
+             * whole blob's -- the whole-blob color used to pick
+             * n_bags/ref_area above is fine for "how many bags is
+             * this" (same-size bags either team), but two DIFFERENT-
+             * team bags overlapping also flood-fill into one blob,
+             * and averaging their colors together would land near
+             * neither team's reference. Splitting spatially first and
+             * classifying each resulting piece separately handles
+             * that correctly, on top of the same-team case. */
+            blobs_out[found].team = classify_team(bu, bv, teamA, teamB);
+            blobs_out[found].color.u_median = bu;
+            blobs_out[found].color.v_median = bv;
+            blobs_out[found].cx_full = (int)(bin_fx[b] / bin_n[b]) * 2;
+            blobs_out[found].cy_full = (int)(bin_fy[b] / bin_n[b]) * 2;
+            blobs_out[found].area = bin_n[b];
+            found++;
+        }
     }
 
     if (next_label >= MAX_BLOBS) {
@@ -386,28 +519,34 @@ int main(int argc, char **argv) {
     int have_quad = kv_get_corners(&kv, corners_full);
     if (have_quad) quad_to_chroma(corners_full, quad_c);
 
+    /* Optional: enables splitting a blob of several touching/
+     * overlapping same-team bags back into individual ones. An older
+     * calibration file that predates this simply won't have these --
+     * kv_get leaves the value at 0.0, which find_all_blobs treats as
+     * "no reference for this team, don't try to split." */
+    double teamA_ref_area = 0.0, teamB_ref_area = 0.0;
+    kv_get(&kv, "teamA_ref_area", &teamA_ref_area);
+    kv_get(&kv, "teamB_ref_area", &teamB_ref_area);
+
     Frame f;
     if (load_frame(frame_path, &f) != 0) return 1;
 
     Blob blobs[MAX_BLOBS];
     int count = find_all_blobs(&f, roi_c, have_quad ? quad_c : NULL,
-                                &bg, bg_u_mad, bg_v_mad, blobs);
+                                &bg, bg_u_mad, bg_v_mad,
+                                &teamA, &teamB, teamA_ref_area, teamB_ref_area,
+                                blobs);
     free_frame(&f);
     if (count < 0) return 1;
 
     for (int i = 0; i < count; i++) {
-        double da = hypot(blobs[i].color.u_median - teamA.u_median,
-                           blobs[i].color.v_median - teamA.v_median);
-        double db = hypot(blobs[i].color.u_median - teamB.u_median,
-                           blobs[i].color.v_median - teamB.v_median);
-        const char *team = (da <= db) ? "A" : "B";
-
         double dx = blobs[i].cx_full - hx;
         double dy = blobs[i].cy_full - hy;
         int in_hole = (dx * dx + dy * dy) <= (hr * hr);
 
-        printf("bag team=%s in_hole=%d cx=%d cy=%d area=%d\n",
-               team, in_hole, blobs[i].cx_full, blobs[i].cy_full, blobs[i].area);
+        printf("bag team=%c in_hole=%d cx=%d cy=%d area=%d\n",
+               blobs[i].team, in_hole, blobs[i].cx_full, blobs[i].cy_full,
+               blobs[i].area);
     }
 
     fprintf(stderr, "info: %d bag(s) detected\n", count);
