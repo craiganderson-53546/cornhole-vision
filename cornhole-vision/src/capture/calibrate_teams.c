@@ -13,31 +13,52 @@
  *
  * Field workflow (three captures, in order):
  *   1. Empty board, no bags:
- *        calibrate_teams background frame_empty.yuv420 X0 Y0 X1 Y1 X2 Y2 X3 Y3 session.cal
- *   2. One Team A bag placed anywhere on the board:
+ *        calibrate_teams background frame_empty.yuv420 \
+ *            OX0 OY0 OX1 OY1 OX2 OY2 OX3 OY3  IX0 IY0 IX1 IY1 IX2 IY2 IX3 IY3 \
+ *            session.cal
+ *   2. One Team A bag placed anywhere on the board (interior OR tape):
  *        calibrate_teams team A frame_teamA.yuv420 session.cal
- *   3. One Team B bag placed anywhere on the board:
+ *   3. One Team B bag placed anywhere on the board (interior OR tape):
  *        calibrate_teams team B frame_teamB.yuv420 session.cal
  *   4. Check the result:
  *        calibrate_teams validate session.cal
  *
- * X0,Y0 .. X3,Y3 are the board's 4 interior corners, in full-resolution
- * (Y-plane) pixel coordinates -- the same interior boundary that
- * border_detect already locates -- given in order around the perimeter
+ * OX*,OY* is the OUTER boundary (tape-to-carpet) and IX*,IY* is the
+ * INNER boundary (interior-to-tape), both in full-resolution (Y-plane)
+ * pixel coordinates, each given in order around the perimeter
  * (clockwise or counter-clockwise, doesn't matter which, just don't
- * cross them). Wire border_detect's output into step 1 instead of
- * clicking coordinates by hand once that hookup is convenient. A
- * photographed board is rarely axis-aligned in the raw frame (camera
- * mount angle, perspective), so all 4 corners matter: collapsing to 2
- * opposite corners of a bounding box -- the old behavior here --
- * quietly stretches the sampled/scanned region away from the board's
- * true shape, worse the further a point sits from wherever those 2
- * corners happened to be. The tool still derives and stores that
- * bounding box too (as roi_x0/y0/x1/y1), since it's a cheap, useful
- * outer limit for iteration and for any older tooling that only reads
- * the rectangle -- but background/bag sampling itself is now masked
- * to the true quad, and detect_bags does the same for on-board
- * scanning.
+ * cross them). detect_board's "outer"/"inner" output lines are exactly
+ * this format; wire that in instead of clicking coordinates by hand
+ * once that hookup is convenient.
+ *
+ * Two boundaries, not one, because the rules score a bag resting on
+ * the tape identically to one on the interior -- the tape is part of
+ * the playing surface, not excluded territory. That means detect_bags
+ * needs to scan the OUTER boundary (so a tape-resting bag is never
+ * missed), but a single "background" color can't describe both the
+ * interior and the tape at once without smearing them into one
+ * unusable blended reference. So this step samples them separately:
+ * the interior (inside IX*,IY*) becomes "bg", and the ring between the
+ * two boundaries becomes a second reference, "border" -- both are
+ * "this is board, not a bag" as far as detect_bags is concerned, used
+ * together (a pixel must be unlike BOTH to be a bag-blob candidate).
+ * If your board genuinely has no visually distinct border (a plain
+ * uniform surface with no tape), pass the same 4 points for both
+ * OX*,OY* and IX*,IY* -- the "ring" is then empty and only "bg" ends
+ * up populated, degrading gracefully to the old single-reference
+ * behavior.
+ *
+ * A photographed board is rarely axis-aligned in the raw frame (camera
+ * mount angle, perspective), so all 4 corners of each boundary matter:
+ * collapsing to 2 opposite corners of a bounding box -- the old
+ * behavior here -- quietly stretches the sampled/scanned region away
+ * from the board's true shape, worse the further a point sits from
+ * wherever those 2 corners happened to be. The tool still derives and
+ * stores a bounding box too (as roi_x0/y0/x1/y1, from the OUTER
+ * corners), since it's a cheap, useful outer limit for iteration and
+ * for any older tooling that only reads the rectangle -- but
+ * background/bag sampling itself is masked to the true quads, and
+ * detect_bags does the same for on-board scanning.
  *
  * Input frames: raw I420 YUV420 planar, WIDTH x HEIGHT, same format
  * everything else in this project reads off the FIFO. Grab one frame
@@ -236,8 +257,9 @@ static Rect roi_to_chroma(Rect roi_yplane) {
 
 /* ---- Background sampling (whole ROI assumed to be board surface) ---- */
 
-static void sample_background(const Frame *f, Rect roi_c, const Pt *quad_c,
-                               ColorRef *out) {
+static void sample_region(const Frame *f, Rect roi_c,
+                           const Pt *quad_include, const Pt *quad_exclude,
+                           ColorRef *out) {
     int w = roi_c.x1 - roi_c.x0;
     int h = roi_c.y1 - roi_c.y0;
     int n = w * h;
@@ -255,8 +277,12 @@ static void sample_background(const Frame *f, Rect roi_c, const Pt *quad_c,
              * for a board that isn't axis-aligned in the frame (camera
              * perspective), its own corners can fall outside the true
              * board quad -- skip those so a sliver of carpet/border
-             * near a bbox corner never drags the background median. */
-            if (quad_c != NULL && !point_in_quad((double)x, (double)y, quad_c))
+             * near a bbox corner never drags the sampled median.
+             * quad_exclude carves out a second region (e.g. sampling
+             * just the tape ring, not the interior it encloses). */
+            if (quad_include != NULL && !point_in_quad((double)x, (double)y, quad_include))
+                continue;
+            if (quad_exclude != NULL && point_in_quad((double)x, (double)y, quad_exclude))
                 continue;
             uvals[idx] = f->u[y * CHROMA_W + x];
             vvals[idx] = f->v[y * CHROMA_W + x];
@@ -265,7 +291,7 @@ static void sample_background(const Frame *f, Rect roi_c, const Pt *quad_c,
     }
     if (idx == 0) {
         fprintf(stderr,
-            "error: no pixels fell inside the board quad -- check the "
+            "error: no pixels fell inside the sampled region -- check the "
             "corner order/coordinates\n");
         out->has_data = 0;
         free(uvals);
@@ -537,60 +563,92 @@ static int quad_is_simple(const Pt q[4]) {
 }
 
 static int cmd_background(int argc, char **argv) {
-    if (argc != 12) {
+    if (argc != 20) {
         fprintf(stderr,
             "usage: calibrate_teams background <frame.yuv420> "
-            "<x0> <y0> <x1> <y1> <x2> <y2> <x3> <y3> <calib_file>\n"
-            "  x0,y0 .. x3,y3 are the board's 4 interior corners, in "
-            "full-resolution (Y-plane) pixel coordinates, given in order "
+            "<ox0> <oy0> <ox1> <oy1> <ox2> <oy2> <ox3> <oy3> "
+            "<ix0> <iy0> <ix1> <iy1> <ix2> <iy2> <ix3> <iy3> <calib_file>\n"
+            "  outer (ox*,oy*) is the tape-to-carpet boundary; inner "
+            "(ix*,iy*) is the interior-to-tape boundary -- both in full-"
+            "resolution (Y-plane) pixel coordinates, each given in order "
             "around the perimeter (clockwise or counter-clockwise -- just "
-            "not crossed). A rectangle photographed off-axis is still a "
-            "convex quad, so all 4 corners matter even if the board looks "
-            "trapezoidal in the raw frame; don't collapse it to 2 opposite "
-            "corners of a bounding box.\n");
+            "not crossed). Both boundaries matter because the rules score "
+            "a bag on the tape the same as one on the interior: the outer "
+            "quad becomes the actual scan region (so a bag resting on the "
+            "tape is never missed), and the gap between the two is used "
+            "to sample the tape's own color as a second 'this is board, "
+            "not a bag' reference, alongside the interior's.\n");
         return 1;
     }
     const char *frame_path = argv[2];
-    Pt corners_full[4] = {
+    Pt outer_full[4] = {
         { atof(argv[3]),  atof(argv[4])  },
         { atof(argv[5]),  atof(argv[6])  },
         { atof(argv[7]),  atof(argv[8])  },
         { atof(argv[9]),  atof(argv[10]) },
     };
-    const char *calib_path = argv[11];
+    Pt inner_full[4] = {
+        { atof(argv[11]), atof(argv[12]) },
+        { atof(argv[13]), atof(argv[14]) },
+        { atof(argv[15]), atof(argv[16]) },
+        { atof(argv[17]), atof(argv[18]) },
+    };
+    const char *calib_path = argv[19];
 
-    if (!quad_is_simple(corners_full)) {
+    if (!quad_is_simple(outer_full)) {
         fprintf(stderr,
-            "error: these 4 corners cross over themselves (a 'bowtie'), "
-            "not a simple board outline -- most likely two of them are "
-            "out of order. Walk the perimeter in one direction, e.g. "
-            "top-left, top-right, bottom-right, bottom-left -- don't "
-            "jump diagonally (top-left, top-right, bottom-LEFT, "
-            "bottom-right is the mistake this usually is).\n");
+            "error: the OUTER 4 corners cross over themselves (a "
+            "'bowtie'), not a simple board outline -- most likely two of "
+            "them are out of order. Walk the perimeter in one direction, "
+            "e.g. top-left, top-right, bottom-right, bottom-left -- "
+            "don't jump diagonally.\n");
+        return 1;
+    }
+    if (!quad_is_simple(inner_full)) {
+        fprintf(stderr,
+            "error: the INNER 4 corners cross over themselves (a "
+            "'bowtie') -- same issue as the outer ones, just on the "
+            "interior-to-tape boundary instead.\n");
         return 1;
     }
 
     Rect roi_y = {
-        .x0 = (int)corners_full[0].x, .y0 = (int)corners_full[0].y,
-        .x1 = (int)corners_full[0].x, .y1 = (int)corners_full[0].y,
+        .x0 = (int)outer_full[0].x, .y0 = (int)outer_full[0].y,
+        .x1 = (int)outer_full[0].x, .y1 = (int)outer_full[0].y,
     };
     for (int i = 1; i < 4; i++) {
-        if (corners_full[i].x < roi_y.x0) roi_y.x0 = (int)corners_full[i].x;
-        if (corners_full[i].x > roi_y.x1) roi_y.x1 = (int)corners_full[i].x;
-        if (corners_full[i].y < roi_y.y0) roi_y.y0 = (int)corners_full[i].y;
-        if (corners_full[i].y > roi_y.y1) roi_y.y1 = (int)corners_full[i].y;
+        if (outer_full[i].x < roi_y.x0) roi_y.x0 = (int)outer_full[i].x;
+        if (outer_full[i].x > roi_y.x1) roi_y.x1 = (int)outer_full[i].x;
+        if (outer_full[i].y < roi_y.y0) roi_y.y0 = (int)outer_full[i].y;
+        if (outer_full[i].y > roi_y.y1) roi_y.y1 = (int)outer_full[i].y;
     }
 
     Frame f;
     if (load_frame(frame_path, &f) != 0) return 1;
 
     Rect roi_c = roi_to_chroma(roi_y);
-    Pt quad_c[4];
-    quad_to_chroma(corners_full, quad_c);
-    ColorRef bg;
-    sample_background(&f, roi_c, quad_c, &bg);
+    Pt outer_c[4], inner_c[4];
+    quad_to_chroma(outer_full, outer_c);
+    quad_to_chroma(inner_full, inner_c);
+
+    ColorRef bg;     /* interior: inside the inner quad */
+    sample_region(&f, roi_c, inner_c, NULL, &bg);
+    if (!bg.has_data) {
+        free_frame(&f);
+        return 1;
+    }
+    ColorRef border; /* tape: inside outer, outside inner -- the ring */
+    sample_region(&f, roi_c, outer_c, inner_c, &border);
     free_frame(&f);
-    if (!bg.has_data) return 1;
+    int have_border = border.has_data;
+    if (!have_border) {
+        fprintf(stderr,
+            "note: no pixels fell between the outer and inner quads -- "
+            "treating this as a board with no visually distinct tape "
+            "(outer and inner boundaries are the same, or nearly so). "
+            "Proceeding with just the interior reference, same as "
+            "before this outer/inner split existed.\n");
+    }
 
     KVStore kv;
     kv_load(&kv, calib_path); /* start fresh or reuse existing file if present */
@@ -602,12 +660,23 @@ static int cmd_background(int argc, char **argv) {
     kv_set(&kv, "roi_y0", roi_y.y0);
     kv_set(&kv, "roi_x1", roi_y.x1);
     kv_set(&kv, "roi_y1", roi_y.y1);
-    kv_set_corners(&kv, corners_full);
+    /* The OUTER quad is what gets stored as "the" board quad -- it's
+     * what detect_bags scans and what find_bag_blob (the 'team' steps
+     * below) searches, since the tape is legitimate playing surface,
+     * not excluded territory. The inner quad is only needed transiently,
+     * right here, to separate the two sampling regions -- it doesn't
+     * need to be persisted for anything downstream to work. */
+    kv_set_corners(&kv, outer_full);
     colorref_to_kv(&kv, "bg", &bg);
+    if (have_border) colorref_to_kv(&kv, "border", &border);
     kv_save(&kv, calib_path);
 
-    printf("background: U median=%.1f (MAD %.1f)  V median=%.1f (MAD %.1f)\n",
+    printf("interior: U median=%.1f (MAD %.1f)  V median=%.1f (MAD %.1f)\n",
            bg.u_median, bg.u_mad, bg.v_median, bg.v_mad);
+    if (have_border) {
+        printf("tape:     U median=%.1f (MAD %.1f)  V median=%.1f (MAD %.1f)\n",
+               border.u_median, border.u_mad, border.v_median, border.v_mad);
+    }
     printf("saved to '%s'. Next: place a Team A bag and run the 'team A' step.\n",
            calib_path);
     return 0;
@@ -727,6 +796,16 @@ static int cmd_validate(int argc, char **argv) {
     report_pair("background", &bg, "Team B", &teamB, &all_ok);
     report_pair("Team A", &teamA, "Team B", &teamB, &all_ok);
 
+    ColorRef border;
+    if (kv_to_colorref(&kv, "border", &border)) {
+        report_pair("tape", &border, "Team A", &teamA, &all_ok);
+        report_pair("tape", &border, "Team B", &teamB, &all_ok);
+    } else {
+        printf("  (no tape/border reference in this file -- predates the "
+               "outer/inner background split; only interior separation "
+               "was checked above)\n");
+    }
+
     printf("\nField calibration: %s\n", all_ok ? "PASS" : "FAIL");
 
     double hx, hy, hr;
@@ -817,7 +896,7 @@ static int cmd_hole(int argc, char **argv) {
 static void print_top_usage(const char *prog) {
     fprintf(stderr,
         "usage:\n"
-        "  %s background <frame.yuv420> <x0> <y0> <x1> <y1> <x2> <y2> <x3> <y3> <calib_file>\n"
+        "  %s background <frame.yuv420> <ox0> <oy0>..<ox3> <oy3> <ix0> <iy0>..<ix3> <iy3> <calib_file>\n"
         "  %s team <A|B> <frame.yuv420> <calib_file>\n"
         "  %s hole <cx> <cy> <radius> <calib_file>\n"
         "  %s validate <calib_file>\n",

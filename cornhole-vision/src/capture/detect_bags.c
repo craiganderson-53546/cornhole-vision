@@ -22,7 +22,13 @@
  * back to the plain bounding box for an older calibration file that
  * predates it) so the scan follows the board's actual shape in the
  * frame rather than a rectangle that's only approximately right for a
- * board photographed at an angle.
+ * board photographed at an angle. That quad is the OUTER (tape-to-
+ * carpet) boundary, since the rules score a bag on the tape the same
+ * as one on the interior -- the tape is playing surface, not excluded
+ * territory. A pixel only counts as a candidate bag pixel if it's
+ * unlike BOTH the interior color and the tape color (when calibrated;
+ * an older calibration file without a tape reference just checks the
+ * interior, same as before this existed).
  *
  * Same-team bags touching or overlapping flood-fill into a single
  * connected blob; if calibrate_teams has recorded that team's single-
@@ -270,6 +276,8 @@ static char classify_team(double u, double v, const ColorRef *teamA,
  * that case, same as the old single-blob-only behavior). */
 static int find_all_blobs(const Frame *f, Rect roi_c, const Pt *quad_c,
                            const ColorRef *bg, double bg_u_mad, double bg_v_mad,
+                           const ColorRef *border, double border_u_mad,
+                           double border_v_mad,
                            const ColorRef *teamA, const ColorRef *teamB,
                            double teamA_ref_area, double teamB_ref_area,
                            Blob *blobs_out) {
@@ -285,6 +293,19 @@ static int find_all_blobs(const Frame *f, Rect roi_c, const Pt *quad_c,
     double threshold = combined_mad * DEVIATION_MAD_MULTIPLIER;
     if (threshold < DEVIATION_FLOOR) threshold = DEVIATION_FLOOR;
 
+    /* Optional second "this is board, not a bag" reference -- the
+     * board's tape/border, scored by the rules the same as the
+     * interior. A calibration file without it (predates the outer/
+     * inner split, or a board with no visually distinct border) means
+     * border is NULL here, and a pixel only has to clear the interior
+     * threshold, same as before this existed. */
+    double border_threshold = 0.0;
+    if (border != NULL) {
+        double border_combined_mad = (border_u_mad + border_v_mad) / 2.0;
+        border_threshold = border_combined_mad * DEVIATION_MAD_MULTIPLIER;
+        if (border_threshold < DEVIATION_FLOOR) border_threshold = DEVIATION_FLOOR;
+    }
+
     uint8_t *mask = calloc(n, 1);
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
@@ -294,7 +315,14 @@ static int find_all_blobs(const Frame *f, Rect roi_c, const Pt *quad_c,
             double du = (double)f->u[fy * CHROMA_W + fx] - bg->u_median;
             double dv = (double)f->v[fy * CHROMA_W + fx] - bg->v_median;
             double dist = sqrt(du * du + dv * dv);
-            mask[y * w + x] = (dist > threshold) ? 1 : 0;
+            int candidate = dist > threshold;
+            if (candidate && border != NULL) {
+                double bdu = (double)f->u[fy * CHROMA_W + fx] - border->u_median;
+                double bdv = (double)f->v[fy * CHROMA_W + fx] - border->v_median;
+                double bdist = sqrt(bdu * bdu + bdv * bdv);
+                if (bdist <= border_threshold) candidate = 0; /* it's tape */
+            }
+            mask[y * w + x] = candidate ? 1 : 0;
         }
     }
 
@@ -528,12 +556,27 @@ int main(int argc, char **argv) {
     kv_get(&kv, "teamA_ref_area", &teamA_ref_area);
     kv_get(&kv, "teamB_ref_area", &teamB_ref_area);
 
+    /* Optional: a second "this is board, not a bag" reference for the
+     * tape/border, which the rules score the same as the interior. A
+     * calibration file predating the outer/inner background split (or
+     * a board with no visually distinct tape) just won't have this --
+     * border stays NULL and find_all_blobs falls back to checking only
+     * the interior reference, same as before this existed. */
+    double border_u = 0.0, border_v = 0.0, border_u_mad = 0.0, border_v_mad = 0.0;
+    int have_border = kv_get(&kv, "border_u_median", &border_u) &&
+                       kv_get(&kv, "border_v_median", &border_v) &&
+                       kv_get(&kv, "border_u_mad", &border_u_mad) &&
+                       kv_get(&kv, "border_v_mad", &border_v_mad);
+    ColorRef border = { .u_median = border_u, .v_median = border_v };
+
     Frame f;
     if (load_frame(frame_path, &f) != 0) return 1;
 
     Blob blobs[MAX_BLOBS];
     int count = find_all_blobs(&f, roi_c, have_quad ? quad_c : NULL,
                                 &bg, bg_u_mad, bg_v_mad,
+                                have_border ? &border : NULL,
+                                border_u_mad, border_v_mad,
                                 &teamA, &teamB, teamA_ref_area, teamB_ref_area,
                                 blobs);
     free_frame(&f);

@@ -22,3 +22,6 @@ calibrate_teams: src/capture/calibrate_teams.c
 
 detect_bags: src/capture/detect_bags.c
 	$(CC) -std=c17 -O2 -o $@ $< -lm
+	
+detect_board: src/capture/detect_board.c
+	$(CC) -std=c17 -O2 -o $@ $< -lm
