@@ -94,12 +94,24 @@
 #define UV_SIZE  (CHROMA_W * CHROMA_H)
 #define FRAME_SIZE (Y_SIZE + 2 * UV_SIZE)
 
-/* Same tuning family as detect_bags/calibrate_teams. The border check
- * can afford to be a little tighter than bag detection (a known,
- * uniform tape color sampled fresh each session) since it's not
- * fighting shadow/glare variation across a whole board surface. */
+/* Same tuning family as detect_bags/calibrate_teams. BORDER_DEVIATION_
+ * FLOOR was originally set tighter than bag detection's, on the
+ * assumption that a single-click tape sample wouldn't need to fight
+ * shadow/glare variation the way a whole board surface does. That
+ * assumption turned out wrong: measured directly against a real
+ * captured frame, one edge's tape color drifted smoothly up to ~10
+ * units away from the click point's sampled color under real
+ * directional lighting, over a long stretch (not a scattering of
+ * noisy pixels) -- comfortably past the old floor of 6. 15 gives
+ * margin above that measurement while staying well under
+ * BORDER_MAX_PIXEL_FRACTION (measured ~8% of frame matched at this
+ * floor on that same real frame, vs. the 30% ceiling). If a future
+ * board/lighting setup still fragments the ring at this floor, the
+ * fix is to measure again the same way: sample the real captured
+ * frame's deviation-from-click-color along the problem edge and see
+ * how far it actually strays, rather than guessing a bigger number. */
 #define BORDER_DEVIATION_MAD_MULTIPLIER 4.0
-#define BORDER_DEVIATION_FLOOR          6.0
+#define BORDER_DEVIATION_FLOOR          15.0
 #define BORDER_MIN_PIXEL_FRACTION       0.01  /* of the whole frame */
 #define BORDER_MAX_PIXEL_FRACTION       0.30  /* of the whole frame */
 
@@ -458,6 +470,49 @@ static void keep_largest_component(uint8_t *mask, int w, int h) {
     free(stack);
 }
 
+/* Dilates a binary mask outward by `radius` chroma-plane pixels,
+ * closing small gaps. A real camera frame has sensor noise and
+ * lighting variation a synthetic test frame doesn't -- a tape color
+ * close to neutral (low U/V saturation) with a tight sampled MAD
+ * narrows the match threshold enough that a handful of borderline
+ * pixels somewhere along an otherwise visibly-solid ring can fail the
+ * color match, punching a thin gap invisible at normal viewing
+ * distance. That gap is still fatal to a flood-fill wall -- the fill
+ * escapes through any single missing pixel regardless of how solid
+ * the rest of the ring looks -- so gaps need closing before the wall
+ * is used, not after. */
+static void dilate_mask(uint8_t *mask, int w, int h, int radius) {
+    uint8_t *src = malloc((size_t)w * h);
+    memcpy(src, mask, (size_t)w * h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            if (src[y * w + x]) continue;
+            int found = 0;
+            for (int dy = -radius; dy <= radius && !found; dy++) {
+                int ny = y + dy;
+                if (ny < 0 || ny >= h) continue;
+                for (int dx = -radius; dx <= radius; dx++) {
+                    int nx = x + dx;
+                    if (nx < 0 || nx >= w) continue;
+                    if (src[ny * w + nx]) { found = 1; break; }
+                }
+            }
+            if (found) mask[y * w + x] = 1;
+        }
+    }
+    free(src);
+}
+
+/* How far (chroma-plane px) to close gaps in the border mask. With
+ * BORDER_DEVIATION_FLOOR raised to fix the real cause (a smooth
+ * lighting-gradient color drift, not spatial gaps -- see above), this
+ * radius is back to a modest safety net for genuinely isolated noise
+ * pixels, not the primary mechanism: measured against the same real
+ * frame, floor=15 alone (radius 0) already fully merged the ring into
+ * one connected piece. 3 chroma px (~6px full-res) stays cheap and
+ * harmless on top of that. */
+#define BORDER_GAP_CLOSE_RADIUS_CHROMA 3
+
 /* ---- Step 1: sample the border's own color from a small patch ---- */
 
 static int sample_border_color(const Frame *f, int sx, int sy,
@@ -548,6 +603,14 @@ static int find_border_corners(const Frame *f, double u_med, double v_med,
         free(is_border);
         return -1;
     }
+
+    /* Close small gaps BEFORE filtering to the largest component --
+     * if a gap split the ring into two disconnected arcs, dilating
+     * first reconnects them into one piece so keep_largest_component
+     * below doesn't mistake the smaller arc for noise and discard it.
+     * Doing this after keep_largest_component would be too late: a
+     * discarded arc's pixels are already gone by then. */
+    dilate_mask(is_border, CHROMA_W, CHROMA_H, BORDER_GAP_CLOSE_RADIUS_CHROMA);
 
     /* Drop everything except the single largest connected blob of
      * border-colored pixels -- the actual ring, discarding any
@@ -787,24 +850,62 @@ static int find_hole(const Frame *f, const Pt corners[4],
         }
     }
 
-    int best_label = 0, best_size = 0;
+    /* Picking by raw size alone breaks on a real board: a shadow or a
+     * smudge/mark on the interior can be both darker than the true
+     * hole AND larger in area (confirmed directly against a real
+     * captured frame -- a shadowed patch there was 38355px vs. the
+     * actual hole's 23256px, and would have been selected outright).
+     * A hole has a shape a shadow/smudge usually doesn't: circular.
+     * Score every size-plausible blob by how closely its bounding box
+     * matches a circle's -- fill_ratio (area / bbox area) near a
+     * circle's pi/4, and the bbox itself near square -- and take the
+     * best-scoring one, not just the biggest. */
+    int *bbox_x0 = malloc(sizeof(int) * (next_label + 1));
+    int *bbox_x1 = malloc(sizeof(int) * (next_label + 1));
+    int *bbox_y0 = malloc(sizeof(int) * (next_label + 1));
+    int *bbox_y1 = malloc(sizeof(int) * (next_label + 1));
     for (int l = 1; l <= next_label; l++) {
-        if (sizes[l] > best_size) { best_size = sizes[l]; best_label = l; }
+        bbox_x0[l] = w; bbox_x1[l] = -1;
+        bbox_y0[l] = h; bbox_y1[l] = -1;
+    }
+    for (int i = 0; i < n; i++) {
+        int l = label[i];
+        if (l == 0) continue;
+        int py = i / w, px = i % w;
+        if (px < bbox_x0[l]) bbox_x0[l] = px;
+        if (px > bbox_x1[l]) bbox_x1[l] = px;
+        if (py < bbox_y0[l]) bbox_y0[l] = py;
+        if (py > bbox_y1[l]) bbox_y1[l] = py;
     }
 
+    int best_label = 0;
+    double best_score = 1e18; /* lower is better: distance from "circle" */
+    for (int l = 1; l <= next_label; l++) {
+        if (sizes[l] < (int)(interior_area * HOLE_MIN_AREA_FRACTION)) continue;
+        if (sizes[l] > (int)(interior_area * HOLE_MAX_AREA_FRACTION)) continue;
+        int bw = bbox_x1[l] - bbox_x0[l] + 1, bh = bbox_y1[l] - bbox_y0[l] + 1;
+        if (bw <= 0 || bh <= 0) continue;
+        double fill_ratio = (double)sizes[l] / (bw * bh);
+        double aspect = (bw > bh) ? (double)bw / bh : (double)bh / bw;
+        double fill_error = fabs(fill_ratio - (M_PI / 4.0));
+        double aspect_error = aspect - 1.0; /* >= 0 */
+        double score = fill_error + 0.5 * aspect_error;
+        if (score < best_score) { best_score = score; best_label = l; }
+    }
+    free(bbox_x0); free(bbox_x1); free(bbox_y0); free(bbox_y1);
+
     int ok = 1;
-    if (best_label == 0 ||
-        best_size < (int)(interior_area * HOLE_MIN_AREA_FRACTION) ||
-        best_size > (int)(interior_area * HOLE_MAX_AREA_FRACTION)) {
+    if (best_label == 0) {
         fprintf(stderr,
-            "warning: no plausible hole-sized dark region found (largest "
-            "dark blob: %d px, need roughly %.0f-%.0f for a hole) -- "
-            "omitting hole from output. Run calibrate_teams hole by hand "
-            "for this session.\n",
-            best_size, interior_area * HOLE_MIN_AREA_FRACTION,
+            "warning: no plausible hole-shaped dark region found (need "
+            "roughly %.0f-%.0f px, reasonably circular) -- omitting hole "
+            "from output. Run calibrate_teams hole by hand for this "
+            "session.\n",
+            interior_area * HOLE_MIN_AREA_FRACTION,
             interior_area * HOLE_MAX_AREA_FRACTION);
         ok = 0;
     } else {
+        int best_size = sizes[best_label];
         long x_sum = 0, y_sum = 0;
         for (int i = 0; i < n; i++) {
             if (label[i] != best_label) continue;

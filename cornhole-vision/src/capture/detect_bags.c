@@ -85,6 +85,16 @@
 #define DEVIATION_FLOOR          8.0
 #define MIN_BLOB_AREA_FRACTION   0.004
 
+/* The actual rule: a bag counts as on the board if MORE THAN HALF its
+ * area rests within the outer boundary -- not "any part touching",
+ * and not merely "big enough to not be noise" (the old use of
+ * MIN_BLOB_AREA_FRACTION below). This is checked against each team's
+ * own calibrated single-bag reference area once a blob's team is
+ * known (see find_all_blobs) -- MIN_BLOB_AREA_FRACTION remains only
+ * as a fallback for a calibration file that predates ref_area, where
+ * there's no per-bag size to compare against. */
+#define BAG_ON_BOARD_FRACTION    0.5
+
 typedef struct {
     uint8_t *y, *u, *v;
 } Frame;
@@ -355,11 +365,28 @@ static int find_all_blobs(const Frame *f, Rect roi_c, const Pt *quad_c,
         }
     }
 
-    int min_area = (int)(n * MIN_BLOB_AREA_FRACTION);
+    /* A cheap, generous pre-filter only -- just enough to skip pure
+     * single/few-pixel sensor noise before bothering to compute a
+     * centroid and classify it. This is NOT the "is this actually a
+     * bag" decision; that happens below, per-blob, once its team (and
+     * therefore its real reference size) is known. Using the smaller
+     * of the two teams' reference areas when available keeps this
+     * floor well under the real 50% threshold for either team, so it
+     * never rejects something the real check should still get a look
+     * at. */
+    double smallest_ref_area = 0.0;
+    if (teamA_ref_area > 0.0 && teamB_ref_area > 0.0) {
+        smallest_ref_area = (teamA_ref_area < teamB_ref_area) ? teamA_ref_area : teamB_ref_area;
+    } else if (teamA_ref_area > 0.0 || teamB_ref_area > 0.0) {
+        smallest_ref_area = (teamA_ref_area > 0.0) ? teamA_ref_area : teamB_ref_area;
+    }
+    int prefilter_area = smallest_ref_area > 0.0
+        ? (int)(smallest_ref_area * 0.1)          /* well under any real 50% cutoff */
+        : (int)(n * MIN_BLOB_AREA_FRACTION);       /* no ref_area at all: old flat floor */
     int found = 0;
 
     for (int l = 1; l <= next_label && found < MAX_BLOBS; l++) {
-        if (sizes[l] < min_area) continue; /* too small: noise, not a bag */
+        if (sizes[l] < prefilter_area) continue; /* too small to bother classifying */
 
         long u_sum = 0, v_sum = 0, x_sum = 0, y_sum = 0;
         int count = 0;
@@ -384,6 +411,29 @@ static int find_all_blobs(const Frame *f, Rect roi_c, const Pt *quad_c,
         double cy_mean = (double)y_sum / count;
 
         char team = classify_team(u_mean, v_mean, teamA, teamB);
+
+        /* The real "does this count as on the board" rule: more than
+         * half of THIS bag's area must be within the outer boundary.
+         * sizes[l] is only the visible (on-board) portion -- anything
+         * hanging off the edge over carpet is never scanned at all
+         * (scanning untrusted-color territory caused real problems
+         * earlier in this project) -- so there's no way to directly
+         * measure "what fraction of the whole bag is this." Using
+         * this team's own calibrated single-bag reference area as the
+         * expected full size sidesteps that: if the visible portion
+         * alone is already more than half of a normal whole bag, the
+         * bag must be mostly on the board, without needing to see the
+         * hidden/off-board part at all. No reference for this team
+         * (older calibration) means this can't be checked precisely,
+         * so it falls back to the old, cruder "big enough to not be
+         * noise" floor instead. */
+        double this_ref_area = (team == 'A') ? teamA_ref_area : teamB_ref_area;
+        if (this_ref_area > 0.0) {
+            if (sizes[l] < this_ref_area * BAG_ON_BOARD_FRACTION) continue;
+        } else if (sizes[l] < (int)(n * MIN_BLOB_AREA_FRACTION)) {
+            continue;
+        }
+
         /* For deciding *how many* bags this is, use whichever
          * reference(s) are available rather than trusting this blob's
          * own team guess -- for two different-team bags overlapping,

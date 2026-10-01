@@ -343,19 +343,27 @@ class GameEngine:
 
     def _confirm_new(self, raw: List[BlobReading]) -> None:
         still_pending = {}
-        active_count = sum(1 for b in self.state.bags if b.active)
         for reading in self._unmatched:
             key = (reading.team, reading.cx // PENDING_GRID_PX,
                    reading.cy // PENDING_GRID_PX)
             prev = self._pending_add.get(key)
             streak = (prev['streak'] + 1) if prev else 1
             if streak >= ADD_CONFIRM_POLLS:
-                if active_count < MAX_BAGS:
+                # Gate on total_thrown, not how many bags are currently
+                # active. A round has exactly 8 bags, ever -- capping on
+                # the active count only stops more than 8 being on the
+                # board at once, but a misdetection that flickers (added,
+                # then debounced-removed a few polls later, then added
+                # again elsewhere) keeps active_count low while
+                # total_thrown climbs without bound on every cycle. Once
+                # the real 8 have been thrown, nothing on the board
+                # should be able to add a 9th, no matter how it flickers
+                # -- only a round reset (board cleared, or New Game)
+                # zeroes total_thrown and allows adds again.
+                if self.state.total_thrown < MAX_BAGS:
                     self._add_bag(reading)
-                    active_count += 1
-                # else: board already full -- ignore extra detections
-                # rather than raising, since 9+ blobs usually means
-                # noise/glare, not a 9th bag in a standard game.
+                # else: 8 already thrown this round -- ignore every
+                # further change on the board until the round resets.
             else:
                 still_pending[key] = {'streak': streak}
         self._pending_add = still_pending
